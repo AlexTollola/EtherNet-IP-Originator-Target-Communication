@@ -1,6 +1,8 @@
 import socket
 import struct
 import csv
+import threading
+import time
 
 VERBOSE = False
 
@@ -12,6 +14,15 @@ GET_ATTRIBUTE_SINGLE = 0x0E
 SET_ATTRIBUTE_SINGLE = 0x10
 
 CSV_PATH = "AttributeList.csv"
+
+UDP_PORT = 2222  # implicit messaging port
+RPI_INTERVAL = 0.02  # 20 ms
+CONN_ID_OT = 0x20000002
+CONN_ID_TO = 0x20000001
+
+command_word = 0
+implicit_data = {}
+running = True
 
 # Load attributes from CSV
 
@@ -26,7 +37,11 @@ def load_attributes(file_path):
                 'attribute': int(row['Attribute'], 16),
                 'name': row['Name'].strip(),
                 'type': row['Type'].strip(),
-                'access': row['Access Type'].strip()
+                'access': row['Access Type'].strip(),
+                'implicit': row['Name'].strip() in (
+                    'Logic Command Word',
+                    'Logic Status Word'
+                )
             })
     return attrs
 
@@ -145,6 +160,43 @@ def parse_cip_response(data, typ):
     return decode_value(cip[4:4 + size], typ)
 
 
+# ----- Implicit messaging helpers -----
+
+def build_io_cpf(seq, cmd, conn_id):
+    """Build a simple UDP SendUnitData frame."""
+    address_item = struct.pack('<HHI', 0x00A1, 4, conn_id)
+    data = struct.pack('<H', seq) + struct.pack('<I', cmd)
+    data_item = struct.pack('<HH', 0x00B1, len(data)) + data
+    cpf = struct.pack('<IHH', 0, 0, 2) + address_item + data_item
+    header = struct.pack('<HHII8sI', 0x70, len(cpf), 0, 0, b'\x00'*8, 0)
+    return header + cpf
+
+
+def build_forward_close(session, conn_id_ot, conn_id_to):
+    """Return a minimal ForwardClose request (not a full implementation)."""
+    service = 0x4E
+    path, words = build_path(0x06, 1, 0)
+    payload = struct.pack('<H', 0) + struct.pack('<H', 0)
+    payload += struct.pack('<I', conn_id_ot)
+    payload += struct.pack('<I', conn_id_to)
+    cip = bytes([service, words]) + path + payload
+    return build_rr(session, cip)
+
+
+def udp_receiver(sock):
+    global implicit_data, running
+    while running:
+        try:
+            data, _ = sock.recvfrom(1024)
+        except OSError:
+            break
+        if VERBOSE:
+            print(f"[UDP] Recv {data.hex()}")
+        if len(data) >= 50:
+            status = struct.unpack_from('<I', data, 46)[0]
+            implicit_data['Logic Status Word'] = status
+
+
 def main():
     attrs = load_attributes(CSV_PATH)
     controls = [a for a in attrs if a['access'].lower() == 'control']
@@ -155,6 +207,23 @@ def main():
     sock.connect((host, EIP_PORT))
     session = register_session(sock)
 
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(('', 0))
+    threading.Thread(target=udp_receiver, args=(udp,), daemon=True).start()
+
+    def udp_sender():
+        global command_word, running
+        seq = 0
+        while running:
+            seq = (seq + 1) & 0xFFFF
+            pkt = build_io_cpf(seq, command_word, CONN_ID_OT)
+            udp.sendto(pkt, (host, UDP_PORT))
+            if VERBOSE:
+                print(f"[UDP] Sent seq={seq}, cmd=0x{command_word:08X}")
+            time.sleep(RPI_INTERVAL)
+
+    threading.Thread(target=udp_sender, daemon=True).start()
+
     while True:
         print('\nSelect an option:')
         print(' 1) Change a Control attribute')
@@ -163,32 +232,39 @@ def main():
         choice = input('> ').strip()
         if choice == '1':
             for i, a in enumerate(controls, 1):
-                print(f" {i}) {a['name']} (Class 0x{a['class']:02X}, Instance 0x{a['instance']:04X}, Attribute 0x{a['attribute']:02X}) [{a['type']}]")
+                label = ' [implicit]' if a['implicit'] else ''
+                print(f" {i}) {a['name']} (Class 0x{a['class']:02X}, Instance 0x{a['instance']:04X}, Attribute 0x{a['attribute']:02X}) [{a['type']}]" + label)
             sel = input('Select attribute: ').strip()
             if not sel.isdigit() or not (1 <= int(sel) <= len(controls)):
                 print('Invalid selection.')
                 continue
             attr = controls[int(sel)-1]
             val = input('Enter new value: ')
-            data = encode_value(val, attr['type'])
-            if VERBOSE:
-                print(
-                    f"Setting {attr['name']} (class 0x{attr['class']:02X}, instance 0x{attr['instance']:04X}, attribute 0x{attr['attribute']:02X}) to {val}"
+            if attr['implicit'] and attr['name'] == 'Logic Command Word':
+                global command_word
+                command_word = int(val, 0)
+                print('Command word updated (implicit).')
+            else:
+                data = encode_value(val, attr['type'])
+                if VERBOSE:
+                    print(
+                        f"Setting {attr['name']} (class 0x{attr['class']:02X}, instance 0x{attr['instance']:04X}, attribute 0x{attr['attribute']:02X}) to {val}"
+                    )
+                send_cip(
+                    sock,
+                    session,
+                    build_set(
+                        attr['class'],
+                        attr['instance'],
+                        attr['attribute'],
+                        data,
+                    ),
                 )
-            send_cip(
-                sock,
-                session,
-                build_set(
-                    attr['class'],
-                    attr['instance'],
-                    attr['attribute'],
-                    data,
-                ),
-            )
-            print('Set sent.')
+                print('Set sent.')
         elif choice == '2':
             for i, a in enumerate(monitors, 1):
-                print(f" {i}) {a['name']} (Class 0x{a['class']:02X}, Instance 0x{a['instance']:04X}, Attribute 0x{a['attribute']:02X}) [{a['type']}]")
+                label = ' [implicit]' if a['implicit'] else ''
+                print(f" {i}) {a['name']} (Class 0x{a['class']:02X}, Instance 0x{a['instance']:04X}, Attribute 0x{a['attribute']:02X}) [{a['type']}]" + label)
             sel = input('Select attribute or 0 for all: ').strip()
             if sel == '0':
                 targets = monitors
@@ -202,10 +278,25 @@ def main():
                     print(f"Requesting {a['name']} (class 0x{a['class']:02X}, instance 0x{a['instance']:04X}, attribute 0x{a['attribute']:02X})")
                 resp = send_cip(sock, session, build_get(a['class'], a['instance'], a['attribute']))
                 val = parse_cip_response(resp, a['type'])
-                print(f"{a['name']}: {val}")
+                if a['implicit'] and a['name'] == 'Logic Status Word':
+                    imp_val = implicit_data.get('Logic Status Word')
+                    if imp_val is not None:
+                        print(f"{a['name']} [implicit]: {imp_val}")
+                print(f"{a['name']} [explicit]: {val}")
         elif choice == '3':
+            global running
+            running = False
+            close_pkt = build_forward_close(session, CONN_ID_OT, CONN_ID_TO)
+            sock.sendall(close_pkt)
+            try:
+                resp = sock.recv(1024)
+                if VERBOSE:
+                    print(f"[TCP] Forward Close Resp: {resp.hex()}")
+            except Exception:
+                pass
             unregister_session(sock, session)
             sock.close()
+            udp.close()
             break
         else:
             print('Invalid option.')
