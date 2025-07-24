@@ -2,6 +2,8 @@ import socket
 import struct
 import csv
 
+VERBOSE = False
+
 EIP_PORT = 44818
 REGISTER_SESSION = 0x65
 UNREGISTER_SESSION = 0x66
@@ -117,8 +119,14 @@ def unregister_session(sock, session):
 
 
 def send_cip(sock, session, request):
-    sock.sendall(build_rr(session, request))
-    return sock.recv(1024)
+    payload = build_rr(session, request)
+    if VERBOSE:
+        print(f"--> {payload.hex()}")
+    sock.sendall(payload)
+    data = sock.recv(1024)
+    if VERBOSE:
+        print(f"<-- {data.hex()}")
+    return data
 
 # Parse CIP response value
 
@@ -163,7 +171,20 @@ def main():
             attr = controls[int(sel)-1]
             val = input('Enter new value: ')
             data = encode_value(val, attr['type'])
-            send_cip(sock, session, build_set(attr['class'], attr['instance'], attr['attribute'], data))
+            if VERBOSE:
+                print(
+                    f"Setting {attr['name']} (class 0x{attr['class']:02X}, instance 0x{attr['instance']:04X}, attribute 0x{attr['attribute']:02X}) to {val}"
+                )
+            send_cip(
+                sock,
+                session,
+                build_set(
+                    attr['class'],
+                    attr['instance'],
+                    attr['attribute'],
+                    data,
+                ),
+            )
             print('Set sent.')
         elif choice == '2':
             for i, a in enumerate(monitors, 1):
@@ -177,6 +198,8 @@ def main():
                 print('Invalid selection.')
                 continue
             for a in targets:
+                if VERBOSE:
+                    print(f"Requesting {a['name']} (class 0x{a['class']:02X}, instance 0x{a['instance']:04X}, attribute 0x{a['attribute']:02X})")
                 resp = send_cip(sock, session, build_get(a['class'], a['instance'], a['attribute']))
                 val = parse_cip_response(resp, a['type'])
                 print(f"{a['name']}: {val}")
