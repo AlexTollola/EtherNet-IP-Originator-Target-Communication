@@ -123,13 +123,18 @@ def send_cip(sock, session, request):
 # Parse CIP response value
 
 def parse_cip_response(data, typ):
-    if len(data) < 44:
+    """Extract and decode the value from a GET response."""
+    # 24 bytes ENIP header + 16 bytes CPF items before the CIP payload
+    offset = 40
+    if len(data) < offset + 4:
         return None
-    cip = data[44:]
+    cip = data[offset:]
     if len(cip) < 4:
         return None
     size = len(encode_value(0, typ))
-    return decode_value(cip[4:4+size], typ)
+    if len(cip) < 4 + size:
+        return None
+    return decode_value(cip[4:4 + size], typ)
 
 
 def main():
